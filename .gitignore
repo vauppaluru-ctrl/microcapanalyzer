@@ -1,0 +1,22 @@
+# Environment — never commit API keys
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code session files
+.claude/
