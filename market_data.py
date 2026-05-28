@@ -1,28 +1,24 @@
-"""Market data: direct Yahoo Finance chart API + position size + regime warning."""
+"""Market data containers, Massive API fetch, and position-size utility.
+
+If MASSIVE_API_KEY is set in .env, fetch_market_data() pulls full OHLCV +
+ticker details automatically. CLI args passed from ThinkOrSwim override any
+fetched field when provided.
+"""
 
 from __future__ import annotations
 
 import os
 import time
-import warnings
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 
 import pandas as pd
 import requests
 
-from utils import fmt_millions, fmt_pct, fmt_shares, safe_div
+from utils import safe_div
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-_YF_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+_MASSIVE_BASE = "https://api.massive.com"
+_MASSIVE_HEADERS = {"User-Agent": "microcapanalyzer/1.0"}
 
 
 # ─── Data containers ──────────────────────────────────────────────────────────
@@ -66,210 +62,65 @@ class PeerVolumeData:
     error: str | None = None
 
 
-# ─── Direct chart API ─────────────────────────────────────────────────────────
+# ─── Massive API helpers ───────────────────────────────────────────────────────
 
-def _fetch_chart(ticker: str, range_: str = "90d") -> dict:
-    url = _CHART_URL.format(ticker=ticker)
+def _massive_get(path: str, params: dict) -> dict:
+    api_key = os.getenv("MASSIVE_API_KEY", "")
+    params["apiKey"] = api_key
     r = requests.get(
-        url,
-        params={"range": range_, "interval": "1d", "includePrePost": "false"},
-        headers=_YF_HEADERS,
+        f"{_MASSIVE_BASE}{path}",
+        params=params,
+        headers=_MASSIVE_HEADERS,
         timeout=15,
     )
     r.raise_for_status()
-    data = r.json()
-    results = data.get("chart", {}).get("result")
+    return r.json()
+
+
+def _fetch_ohlcv(ticker: str) -> pd.DataFrame:
+    end = date.today()
+    start = end - timedelta(days=365)
+    data = _massive_get(
+        f"/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}",
+        {"adjusted": "true", "sort": "asc", "limit": 400},
+    )
+    results = data.get("results", [])
     if not results:
-        raise ValueError(f"No chart data returned for {ticker}")
-    return results[0]
-
-
-def _chart_to_ohlcv(result: dict) -> pd.DataFrame:
-    timestamps = result.get("timestamp", [])
-    quotes = result.get("indicators", {}).get("quote", [{}])[0]
-
-    closes = quotes.get("close", [])
-    volumes = quotes.get("volume", [])
-
-    if not timestamps or not closes:
         return pd.DataFrame()
-
-    rows = []
-    for i, ts in enumerate(timestamps):
-        rows.append({
-            "Date": datetime.utcfromtimestamp(ts),
-            "Open": quotes.get("open", [None])[i] if i < len(quotes.get("open", [])) else None,
-            "High": quotes.get("high", [None])[i] if i < len(quotes.get("high", [])) else None,
-            "Low": quotes.get("low", [None])[i] if i < len(quotes.get("low", [])) else None,
-            "Close": closes[i] if i < len(closes) else None,
-            "Volume": volumes[i] if i < len(volumes) else None,
-        })
-
-    df = pd.DataFrame(rows).dropna(subset=["Close", "Volume"])
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.set_index("Date")
-    return df
-
-
-# ─── UPDATE 1: Macro regime warning ───────────────────────────────────────────
-
-def get_regime_warning() -> str | None:
-    """Fetch VIX and SPY; return warning string if macro conditions are adverse."""
-    try:
-        vix_result = _fetch_chart("%5EVIX", range_="5d")
-        vix_df = _chart_to_ohlcv(vix_result)
-        vix_last = float(vix_df["Close"].iloc[-1]) if not vix_df.empty else None
-
-        spy_result = _fetch_chart("SPY", range_="10d")
-        spy_df = _chart_to_ohlcv(spy_result)
-        spy_5d_change = None
-        if len(spy_df) >= 6:
-            spy_5d_change = float((spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-6] - 1) * 100)
-
-        flags = []
-        if vix_last is not None and vix_last > 28:
-            flags.append(f"VIX at {vix_last:.1f} — elevated volatility regime (threshold: 28). Reduce size, widen stops.")
-        if spy_5d_change is not None and spy_5d_change < -4.0:
-            flags.append(f"SPY 5-day return: {spy_5d_change:.1f}% — broad market risk-off (threshold: -4%). Volume spikes may be forced selling.")
-
-        return "\n".join(flags) if flags else None
-    except Exception:
-        return None
-
-
-# ─── UPDATE 3: Position size reality check ────────────────────────────────────
-
-def position_size_reality_check(avg_dollar_volume: float | None) -> dict:
-    """Compare intended position size to avg daily dollar volume."""
-    intended = float(os.getenv("INTENDED_POSITION_SIZE", "25000"))
-
-    if avg_dollar_volume is None or avg_dollar_volume <= 0:
-        return {
-            "intended": intended,
-            "pct_of_adv": None,
-            "rating": "UNKNOWN",
-            "note": "ADV unavailable — liquidity cannot be assessed",
+    rows = [
+        {
+            "Date": pd.to_datetime(r["t"], unit="ms"),
+            "Open":   r.get("o"),
+            "High":   r.get("h"),
+            "Low":    r.get("l"),
+            "Close":  r.get("c"),
+            "Volume": r.get("v"),
         }
-
-    pct = (intended / avg_dollar_volume) * 100
-
-    if pct < 1.0:
-        rating = "EXECUTABLE"
-        note = f"${intended:,.0f} = {pct:.2f}% of 20D ADV — no market impact concern"
-    elif pct < 3.0:
-        rating = "CONSTRAINED"
-        note = f"${intended:,.0f} = {pct:.2f}% of 20D ADV — expect slippage; use limit orders"
-    else:
-        rating = "ILLIQUID"
-        note = f"${intended:,.0f} = {pct:.2f}% of 20D ADV — cannot build position cleanly; reduce size"
-
-    return {"intended": intended, "pct_of_adv": pct, "rating": rating, "note": note}
+        for r in results
+    ]
+    return (
+        pd.DataFrame(rows)
+        .dropna(subset=["Close", "Volume"])
+        .assign(Date=lambda d: pd.to_datetime(d["Date"]))
+        .set_index("Date")
+    )
 
 
-# ─── Main market data fetch ───────────────────────────────────────────────────
-
-def fetch_market_data(ticker: str) -> VolumeMetrics:
-    m = VolumeMetrics(ticker=ticker)
-    try:
-        result = _fetch_chart(ticker, range_="90d")
-        meta = result.get("meta", {})
-
-        m.current_price = meta.get("regularMarketPrice")
-        m.week52_high = meta.get("fiftyTwoWeekHigh")
-        m.week52_low = meta.get("fiftyTwoWeekLow")
-
-        df = _chart_to_ohlcv(result)
-        if df.empty:
-            m.error = "No OHLCV data returned"
-            return m
-
-        hist_60d = df.tail(60).copy()
-        m.ohlcv_60d = hist_60d
-
-        vol_series = hist_60d["Volume"].astype(float)
-        close = hist_60d["Close"].astype(float)
-
-        rolling_mean = vol_series.rolling(20).mean()
-        rolling_std = vol_series.rolling(20).std()
-
-        m.volume_today = int(vol_series.iloc[-1]) if not vol_series.empty else None
-        m.volume_20d_mean = float(rolling_mean.iloc[-1]) if not rolling_mean.empty else None
-        m.volume_20d_std = float(rolling_std.iloc[-1]) if not rolling_std.empty else None
-        m.volume_zscore = safe_div(
-            (m.volume_today - m.volume_20d_mean) if (m.volume_today and m.volume_20d_mean) else None,
-            m.volume_20d_std,
-        )
-
-        m.current_price = float(close.iloc[-1]) if not close.empty else m.current_price
-
-        if len(close) >= 2:
-            m.pct_change_1d = float((close.iloc[-1] / close.iloc[-2] - 1) * 100)
-        if len(close) >= 6:
-            m.pct_change_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
-        if len(close) >= 20:
-            m.pct_change_20d = float((close.iloc[-1] / close.iloc[-20] - 1) * 100)
-
-        if m.current_price and m.week52_high:
-            m.pct_from_52w_high = (m.current_price / m.week52_high - 1) * 100
-        if m.current_price and m.week52_low:
-            m.pct_from_52w_low = (m.current_price / m.week52_low - 1) * 100
-
-        dollar_vol = (hist_60d["Close"] * hist_60d["Volume"]).rolling(20).mean()
-        m.avg_daily_dollar_volume = float(dollar_vol.iloc[-1]) if not dollar_vol.empty else None
-
-        m.volume_pattern = _classify_volume_pattern(hist_60d)
-        _enrich_fundamentals(m, ticker)
-
-    except Exception as exc:
-        m.error = str(exc)
-
-    return m
+def _fetch_ticker_details(ticker: str) -> dict:
+    data = _massive_get(f"/v3/reference/tickers/{ticker}", {})
+    return data.get("results", {})
 
 
-def _enrich_fundamentals(m: VolumeMetrics, ticker: str) -> None:
-    try:
-        import yfinance as yf
-        info = yf.Ticker(ticker).fast_info
-        m.market_cap = getattr(info, "market_cap", None)
-        m.shares_outstanding = getattr(info, "shares", None)
-    except Exception:
-        pass
-
-    if not m.market_cap and m.current_price and m.shares_outstanding:
-        m.market_cap = m.current_price * m.shares_outstanding
+def _fetch_short_interest(ticker: str) -> dict:
+    data = _massive_get(
+        "/stocks/v1/short-interest",
+        {"ticker": ticker, "sort": "settlement_date.desc", "limit": 1},
+    )
+    results = data.get("results", [])
+    return results[0] if results else {}
 
 
-def _classify_volume_pattern(hist: pd.DataFrame) -> str:
-    if len(hist) < 10:
-        return "UNKNOWN"
-
-    recent = hist.tail(20).copy()
-    vol = recent["Volume"].astype(float)
-    close = recent["Close"].astype(float)
-
-    vol_trend = _linear_slope(vol)
-    price_trend = _linear_slope(close)
-
-    price_range_20d_high = close.max()
-    last_price = close.iloc[-1]
-    last_vol = vol.iloc[-1]
-    mean_vol = vol.mean()
-    spike_ratio = last_vol / mean_vol if mean_vol > 0 else 1.0
-
-    if spike_ratio > 3 and abs(vol_trend) < 0.05 * mean_vol:
-        return "VOLATILITY_EVENT"
-
-    if last_price >= price_range_20d_high * 0.98 and vol_trend > 0 and price_trend > 0:
-        return "BREAKOUT_CONFIRMATION"
-
-    if vol_trend > 0 and -0.5 <= price_trend / (last_price * 0.01 + 1e-9) <= 2.0:
-        return "SILENT_ACCUMULATION"
-
-    if vol_trend > 0 and price_trend <= 0:
-        return "DISTRIBUTION"
-
-    return "UNKNOWN"
-
+# ─── Volume pattern classification ────────────────────────────────────────────
 
 def _linear_slope(series: pd.Series) -> float:
     n = len(series)
@@ -283,46 +134,128 @@ def _linear_slope(series: pd.Series) -> float:
     return num / den if den != 0 else 0.0
 
 
-# ─── Peer comparison ──────────────────────────────────────────────────────────
+def _classify_volume_pattern(hist: pd.DataFrame) -> str:
+    if len(hist) < 10:
+        return "UNKNOWN"
+    recent = hist.tail(20).copy()
+    vol = recent["Volume"].astype(float)
+    close = recent["Close"].astype(float)
+    vol_trend = _linear_slope(vol)
+    price_trend = _linear_slope(close)
+    last_price = close.iloc[-1]
+    last_vol = vol.iloc[-1]
+    mean_vol = vol.mean()
+    spike_ratio = last_vol / mean_vol if mean_vol > 0 else 1.0
+    if spike_ratio > 3 and abs(vol_trend) < 0.05 * mean_vol:
+        return "VOLATILITY_EVENT"
+    if last_price >= close.max() * 0.98 and vol_trend > 0 and price_trend > 0:
+        return "BREAKOUT_CONFIRMATION"
+    if vol_trend > 0 and -0.5 <= price_trend / (last_price * 0.01 + 1e-9) <= 2.0:
+        return "SILENT_ACCUMULATION"
+    if vol_trend > 0 and price_trend <= 0:
+        return "DISTRIBUTION"
+    return "UNKNOWN"
 
-_SECTOR_PEERS: dict[str, list[str]] = {
-    "Technology": ["MSFT", "AAPL", "GOOGL", "META", "NVDA"],
-    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "MRK"],
-    "Financials": ["JPM", "BAC", "WFC", "GS", "MS"],
-    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG"],
-    "Consumer Discretionary": ["AMZN", "TSLA", "HD", "MCD", "NKE"],
-    "Industrials": ["CAT", "HON", "UPS", "LMT", "RTX"],
-    "Materials": ["LIN", "APD", "ECL", "DD", "NEM"],
-    "Real Estate": ["AMT", "PLD", "CCI", "EQIX", "SPG"],
-    "Utilities": ["NEE", "DUK", "SO", "D", "AEP"],
-    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "T"],
-    "Consumer Staples": ["PG", "KO", "PEP", "WMT", "COST"],
-}
 
+# ─── Main fetch ───────────────────────────────────────────────────────────────
 
-def fetch_peer_volume(sector: str | None, target_ticker: str) -> list[PeerVolumeData]:
-    if not sector or sector not in _SECTOR_PEERS:
-        return []
+def fetch_market_data(ticker: str) -> VolumeMetrics:
+    m = VolumeMetrics(ticker=ticker)
+    try:
+        df = _fetch_ohlcv(ticker)
+        if df.empty:
+            m.error = "No OHLCV data returned"
+            return m
 
-    peers = [p for p in _SECTOR_PEERS.get(sector, []) if p != target_ticker][:5]
-    results = []
-    for p in peers:
+        hist_60d = df.tail(60).copy()
+        m.ohlcv_60d = hist_60d
+
+        vol = hist_60d["Volume"].astype(float)
+        close = hist_60d["Close"].astype(float)
+
+        rolling_mean = vol.rolling(20).mean()
+        rolling_std = vol.rolling(20).std()
+
+        m.volume_today = int(vol.iloc[-1])
+        m.volume_20d_mean = float(rolling_mean.iloc[-1]) if not rolling_mean.empty else None
+        m.volume_20d_std  = float(rolling_std.iloc[-1])  if not rolling_std.empty  else None
+        m.volume_zscore   = safe_div(
+            (m.volume_today - m.volume_20d_mean) if m.volume_20d_mean else None,
+            m.volume_20d_std,
+        )
+        m.current_price = float(close.iloc[-1])
+
+        if len(close) >= 2:
+            m.pct_change_1d = float((close.iloc[-1] / close.iloc[-2] - 1) * 100)
+        if len(close) >= 6:
+            m.pct_change_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
+        if len(close) >= 20:
+            m.pct_change_20d = float((close.iloc[-1] / close.iloc[-20] - 1) * 100)
+
+        all_high = df["High"].astype(float)
+        all_low  = df["Low"].astype(float)
+        m.week52_high = float(all_high.max())
+        m.week52_low  = float(all_low.min())
+        if m.current_price and m.week52_high:
+            m.pct_from_52w_high = (m.current_price / m.week52_high - 1) * 100
+        if m.current_price and m.week52_low:
+            m.pct_from_52w_low  = (m.current_price / m.week52_low  - 1) * 100
+
+        dollar_vol = (hist_60d["Close"] * hist_60d["Volume"]).rolling(20).mean()
+        m.avg_daily_dollar_volume = float(dollar_vol.iloc[-1]) if not dollar_vol.empty else None
+
+        m.volume_pattern = _classify_volume_pattern(hist_60d)
+
+        # Ticker details (best-effort — missing fields stay None)
         try:
-            result = _fetch_chart(p, range_="30d")
-            df = _chart_to_ohlcv(result)
-            if df.empty:
-                results.append(PeerVolumeData(ticker=p, volume_today=None, volume_20d_mean=None, zscore=None))
-                continue
-            vol = df["Volume"].astype(float)
-            today_vol = int(vol.iloc[-1])
-            mean_20d = float(vol.tail(20).mean())
-            std_20d = float(vol.tail(20).std())
-            zscore = safe_div(today_vol - mean_20d, std_20d)
-            results.append(PeerVolumeData(ticker=p, volume_today=today_vol, volume_20d_mean=mean_20d, zscore=zscore))
-            time.sleep(0.1)
-        except Exception as exc:
-            results.append(PeerVolumeData(ticker=p, volume_today=None, volume_20d_mean=None, zscore=None, error=str(exc)))
-    return results
+            details = _fetch_ticker_details(ticker)
+            m.market_cap         = details.get("market_cap")
+            m.shares_outstanding = details.get("weighted_shares_outstanding")
+            m.industry           = details.get("sic_description")
+            m.sector             = details.get("sic_description")
+        except Exception:
+            pass
+
+        # Short interest (best-effort)
+        try:
+            si = _fetch_short_interest(ticker)
+            if si:
+                short_shares = si.get("short_interest")
+                m.short_ratio = si.get("days_to_cover")
+                if short_shares and m.shares_outstanding:
+                    m.short_pct_float = (short_shares / m.shares_outstanding) * 100
+        except Exception:
+            pass
+
+    except Exception as exc:
+        m.error = str(exc)
+
+    return m
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+def position_size_reality_check(avg_dollar_volume: float | None) -> dict:
+    intended = float(os.getenv("INTENDED_POSITION_SIZE", "25000"))
+
+    if avg_dollar_volume is None or avg_dollar_volume <= 0:
+        return {
+            "intended": intended,
+            "pct_of_adv": None,
+            "rating": "UNKNOWN",
+            "note": "ADV unavailable — liquidity cannot be assessed",
+        }
+
+    pct = (intended / avg_dollar_volume) * 100
+
+    if pct < 1.0:
+        rating, note = "EXECUTABLE",  f"${intended:,.0f} = {pct:.2f}% of 20D ADV — no market impact concern"
+    elif pct < 3.0:
+        rating, note = "CONSTRAINED", f"${intended:,.0f} = {pct:.2f}% of 20D ADV — expect slippage; use limit orders"
+    else:
+        rating, note = "ILLIQUID",    f"${intended:,.0f} = {pct:.2f}% of 20D ADV — cannot build position cleanly; reduce size"
+
+    return {"intended": intended, "pct_of_adv": pct, "rating": rating, "note": note}
 
 
 def is_sector_rotation(peers: list[PeerVolumeData], threshold: float = 1.5) -> bool:

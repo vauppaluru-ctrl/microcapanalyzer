@@ -264,14 +264,24 @@ def _border_for_section(title: str, body: str, verdict: str) -> str:
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
 
-def print_footer(edgar: EdgarData, elapsed_seconds: float) -> None:
+def print_footer(edgar: EdgarData, elapsed_seconds: float, usage: dict | None = None) -> None:
     console.print()
     console.print(Rule())
+    cost_str = ""
+    if usage:
+        cost = usage.get("cost_usd", 0.0)
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        model = usage.get("model", "unknown")
+        cost_str = (
+            f"  •  Cost: [bold]${cost:.4f}[/bold] "
+            f"[dim]({in_tok:,} in / {out_tok:,} out tokens · {model})[/dim]"
+        )
     console.print(
         f"[dim]Analyzed {len(edgar.filings)} filings  •  "
-        f"Runtime: {elapsed_seconds:.1f}s  •  "
-        f"Model: Gemini Flash  •  "
-        f"Not financial advice[/dim]"
+        f"Runtime: {elapsed_seconds:.1f}s[/dim]"
+        f"{cost_str}"
+        f"[dim]  •  Not financial advice[/dim]"
     )
     console.print()
 

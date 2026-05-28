@@ -6,6 +6,7 @@ import os
 import re
 from datetime import date
 
+import anthropic as _anthropic_sdk
 import google.generativeai as genai
 from rich.console import Console as _Console
 from rich.panel import Panel as _Panel
@@ -16,8 +17,43 @@ from utils import fmt_millions, fmt_pct, fmt_shares
 
 _console = _Console()
 
-MODEL = "gemini-2.0-flash-lite"
-MAX_TOKENS = 2500
+# ─── Model registry ───────────────────────────────────────────────────────────
+
+_MODELS: dict[str, dict] = {
+    "claude": {
+        "display": "Claude Sonnet 4.6",
+        "desc":    "best reasoning",
+        "api":     "anthropic",
+        "model_id":"claude-sonnet-4-6",
+        "max_tokens": 8192,
+        "fallbacks":  [],
+    },
+    "gemini-pro": {
+        "display": "Gemini 2.5 Pro",
+        "desc":    "strong, uncapped",
+        "api":     "gemini",
+        "model_id":"gemini-2.5-pro",
+        "max_tokens": 65536,
+        "fallbacks":  ["gemini-2.0-flash", "gemini-2.0-flash-lite"],
+    },
+    "gemini-flash": {
+        "display": "Gemini 2.0 Flash",
+        "desc":    "fast, cheap",
+        "api":     "gemini",
+        "model_id":"gemini-2.0-flash",
+        "max_tokens": 4096,
+        "fallbacks":  ["gemini-2.0-flash-lite", "gemini-flash-lite-latest"],
+    },
+}
+
+# USD per 1M tokens (input, output). Approximate — verify at ai.google.dev/pricing and anthropic.com/pricing.
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "claude-sonnet-4-6":   (3.00,  15.00),
+    "gemini-2.5-pro":      (1.25,  10.00),
+    "gemini-2.0-flash":    (0.10,   0.40),
+    "gemini-2.0-flash-lite":(0.075, 0.30),
+    "gemini-flash-lite-latest":(0.075, 0.30),
+}
 
 # UPDATE 5A: thin filing guard appended to system prompt
 SYSTEM_PROMPT = """\
@@ -294,6 +330,65 @@ Follow the verdict with a maximum 5-sentence summary of your complete reasoning.
 """
 
 
+# ─── API call functions ───────────────────────────────────────────────────────
+
+def _call_claude(model_id: str, max_tokens: int, user_message: str) -> tuple[str, dict]:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set. Add it to your .env file.")
+    client = _anthropic_sdk.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model_id,
+        max_tokens=max_tokens,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+    )
+    in_tok = response.usage.input_tokens
+    out_tok = response.usage.output_tokens
+    in_price, out_price = _MODEL_PRICING.get(model_id, (0.0, 0.0))
+    cost = (in_tok / 1_000_000) * in_price + (out_tok / 1_000_000) * out_price
+    return response.content[0].text, {
+        "model": model_id,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cost_usd": cost,
+    }
+
+
+def _call_gemini(model_id: str, max_tokens: int, fallbacks: list[str], user_message: str) -> tuple[str, dict]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set. Check your .env file.")
+    genai.configure(api_key=api_key)
+    generation_config = genai.types.GenerationConfig(max_output_tokens=max_tokens, temperature=0.2)
+    last_exc: Exception | None = None
+    for candidate in [model_id] + fallbacks:
+        try:
+            model = genai.GenerativeModel(
+                model_name=candidate,
+                system_instruction=SYSTEM_PROMPT,
+                generation_config=generation_config,
+            )
+            response = model.generate_content(user_message)
+            usage = response.usage_metadata
+            in_tok = getattr(usage, "prompt_token_count", 0) or 0
+            out_tok = getattr(usage, "candidates_token_count", 0) or 0
+            in_price, out_price = _MODEL_PRICING.get(candidate, (0.0, 0.0))
+            cost = (in_tok / 1_000_000) * in_price + (out_tok / 1_000_000) * out_price
+            return response.text, {
+                "model": candidate,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cost_usd": cost,
+            }
+        except Exception as exc:
+            last_exc = exc
+            if "429" in str(exc) or "quota" in str(exc).lower() or "rate" in str(exc).lower():
+                continue
+            raise
+    raise last_exc or RuntimeError("All Gemini candidates exhausted")
+
+
 # ─── Main analysis entry point ────────────────────────────────────────────────
 
 def run_analysis(
@@ -301,12 +396,8 @@ def run_analysis(
     metrics: VolumeMetrics,
     edgar: EdgarData,
     peers: list[PeerVolumeData],
-) -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not set. Check your .env file.")
-
-    # UPDATE 5B: thin filing pre-check
+    model_key: str = "claude",
+) -> tuple[str, dict]:
     substantive = [f for f in edgar.filings if len(f.full_text.split()) > 500]
     if len(substantive) < 2:
         _console.print(_Panel(
@@ -319,28 +410,10 @@ def run_analysis(
     form4_parsed = parse_form4_transactions(edgar.filings)
     user_message = _build_user_message(ticker, metrics, edgar, peers, form4_parsed)
 
-    genai.configure(api_key=api_key)
-    generation_config = genai.types.GenerationConfig(max_output_tokens=MAX_TOKENS, temperature=0.2)
-
-    model_candidates = [MODEL, "gemini-flash-lite-latest", "gemini-2.0-flash", "gemini-pro-latest"]
-    last_exc: Exception | None = None
-    for model_name in model_candidates:
-        try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                system_instruction=SYSTEM_PROMPT,
-                generation_config=generation_config,
-            )
-            response = model.generate_content(user_message)
-            return response.text
-        except Exception as exc:
-            last_exc = exc
-            err_str = str(exc)
-            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
-                continue
-            raise
-
-    raise last_exc or RuntimeError("All Gemini model candidates exhausted")
+    cfg = _MODELS[model_key]
+    if cfg["api"] == "anthropic":
+        return _call_claude(cfg["model_id"], cfg["max_tokens"], user_message)
+    return _call_gemini(cfg["model_id"], cfg["max_tokens"], cfg["fallbacks"], user_message)
 
 
 def extract_verdict(brief_text: str) -> str:

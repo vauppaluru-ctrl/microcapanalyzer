@@ -269,3 +269,16 @@ utils.py                # SEC_RATE_LIMIT_SLEEP, sec_sleep(), retry_with_backoff(
 .env                    # GEMINI_API_KEY + INTENDED_POSITION_SIZE (never commit this file)
 ~/.local/bin/analyzeVolumeSpike  # Global executable (zsh wrapper around .venv python)
 ```
+
+---
+
+## graphify
+
+This project has a graphify knowledge graph at `graphify-out/`.
+
+**MANDATORY: Before answering any architecture question or making any code change, read `graphify-out/GRAPH_REPORT.md` for god nodes and community structure.** This graph encodes cross-module call relationships, data flows, and design rationale that are not obvious from reading individual files.
+
+Rules:
+- Before answering architecture or codebase questions, read `graphify-out/GRAPH_REPORT.md` first
+- Before editing any file, check which community it belongs to and which god nodes connect through it
+- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
