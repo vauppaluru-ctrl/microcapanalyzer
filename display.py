@@ -221,7 +221,7 @@ def print_research_brief(brief_text: str) -> None:
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
     import re
-    pattern = re.compile(r"^(?:#+\s*)?(\d+\.\s+[A-Z][A-Z .,/\-—()]+)", re.MULTILINE)
+    pattern = re.compile(r"^(?:#+\s*)?(\d+\.\s+[A-Za-z][A-Za-z .,/\-—()]+)", re.MULTILINE)
     matches = list(pattern.finditer(text))
     if not matches:
         return []
@@ -238,13 +238,35 @@ def _split_sections(text: str) -> list[tuple[str, str]]:
 
 def _border_for_section(title: str, body: str, verdict: str) -> str:
     upper_title = title.upper()
+    upper_body  = body.upper()
 
-    # UPDATE 6: qualitative dilution assessment drives border color
-    if "TOXIC" in upper_title:
-        body_upper = body.upper()
-        if "HIGH DILUTION RISK" in body_upper:
+    # ── New 5-section forensic format ────────────────────────────────────────
+    if "EXECUTIVE VERDICT" in upper_title:
+        if "GENUINE ACCUMULATION" in upper_body:
+            return "bold green"
+        if "DEAD MONEY" in upper_body:
+            return "bold yellow"
+        return "bold red"  # Active Toxic Dilution or Active ATM Distribution
+
+    if "DILUTION MECHANICS" in upper_title:
+        if "YES" in upper_body:
             return "bold red"
-        if "ELEVATED" in body_upper:
+        return "bold green"
+
+    if "QUANTITATIVE HEALTH" in upper_title:
+        return "blue"
+
+    if "DEMAND FOOTPRINT" in upper_title:
+        return "cyan"
+
+    if "SKEPTICAL" in upper_title:
+        return "yellow"
+
+    # ── Legacy 8-section format (backward compat) ─────────────────────────
+    if "TOXIC" in upper_title:
+        if "HIGH DILUTION RISK" in upper_body:
+            return "bold red"
+        if "ELEVATED" in upper_body:
             return "bold yellow"
         return "bold green"
 

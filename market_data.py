@@ -89,7 +89,7 @@ def _fetch_ohlcv(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
     rows = [
         {
-            "Date": pd.to_datetime(r["t"], unit="ms"),
+            "Date":   pd.Timestamp(r["t"], unit="ms"),
             "Open":   r.get("o"),
             "High":   r.get("h"),
             "Low":    r.get("l"),
@@ -98,12 +98,7 @@ def _fetch_ohlcv(ticker: str) -> pd.DataFrame:
         }
         for r in results
     ]
-    return (
-        pd.DataFrame(rows)
-        .dropna(subset=["Close", "Volume"])
-        .assign(Date=lambda d: pd.to_datetime(d["Date"]))
-        .set_index("Date")
-    )
+    return pd.DataFrame(rows).dropna(subset=["Close", "Volume"]).set_index("Date")
 
 
 def _fetch_ticker_details(ticker: str) -> dict:

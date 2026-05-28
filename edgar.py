@@ -80,6 +80,9 @@ class EdgarData:
     catalyst_dates: list[dict[str, str]] = field(default_factory=list)
     filing_velocity_30d: int = 0
     filing_velocity_prior_60d: int = 0
+    dilution_velocity: list[dict] = field(default_factory=list)
+    warrant_overhang: list[dict] = field(default_factory=list)
+    insider_clusters: list[dict] = field(default_factory=list)
     error: str | None = None
 
 
@@ -205,6 +208,37 @@ def _parse_filings_from_submissions(submissions: dict, cik: str, lookback_days: 
     return records
 
 
+def _fetch_extended_tenqs(submissions: dict, cik: str, limit: int = 4) -> list[FilingRecord]:
+    """Return up to `limit` 10-Q filings from the past 365 days for dilution/warrant analysis."""
+    cutoff = datetime.now() - timedelta(days=365)
+    recent = submissions.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    accessions = recent.get("accessionNumber", [])
+    primary_docs = recent.get("primaryDocument", [])
+    records: list[FilingRecord] = []
+    for form, date_str, acc, pdoc in zip(forms, dates, accessions, primary_docs):
+        if form.strip() != "10-Q":
+            continue
+        try:
+            filed_dt = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if filed_dt < cutoff:
+            continue
+        records.append(FilingRecord(
+            form_type="10-Q",
+            filed_date=date_str,
+            accession_no=acc,
+            primary_doc=pdoc,
+            cik=cik,
+            priority="MEDIUM",
+        ))
+        if len(records) >= limit:
+            break
+    return records
+
+
 # ─── Document fetch ────────────────────────────────────────────────────────────
 
 def _build_doc_url(cik: str, accession_no: str, filename: str) -> str:
@@ -298,6 +332,47 @@ def _parse_insider_summary(form4_filings: list[FilingRecord]) -> InsiderSummary:
     return summary
 
 
+_INSIDER_NAME_RE = re.compile(
+    r"(?:reporting\s*owner|rptOwnerName)[^A-Za-z]*([A-Z][A-Za-z\s,.-]{4,50})",
+    re.IGNORECASE,
+)
+
+
+def _detect_insider_clusters(form4_filings: list[FilingRecord]) -> list[dict]:
+    """Detect 14-day windows where 2+ distinct insiders made open-market purchases (P-code)."""
+    buys: list[dict] = []
+    for f in form4_filings:
+        if not re.search(r"\bP\b", f.full_text):
+            continue
+        name_m = _INSIDER_NAME_RE.search(f.full_text)
+        name = name_m.group(1).strip() if name_m else "Unknown"
+        try:
+            dt = datetime.strptime(f.filed_date, "%Y-%m-%d")
+        except ValueError:
+            continue
+        buys.append({"name": name, "date": dt, "date_str": f.filed_date})
+    if len(buys) < 2:
+        return []
+    buys.sort(key=lambda x: x["date"])
+    clusters: list[dict] = []
+    for i, anchor in enumerate(buys):
+        window_end = anchor["date"] + timedelta(days=14)
+        window_buys = [b for b in buys[i:] if b["date"] <= window_end]
+        distinct_names = {b["name"] for b in window_buys}
+        if len(distinct_names) < 2:
+            continue
+        cluster = {
+            "window_start": anchor["date_str"],
+            "window_end": window_end.strftime("%Y-%m-%d"),
+            "insider_count": len(distinct_names),
+            "names": list(distinct_names),
+            "transaction_count": len(window_buys),
+        }
+        if not clusters or anchor["date_str"] > clusters[-1]["window_end"]:
+            clusters.append(cluster)
+    return clusters
+
+
 # ─── Cash runway from 10-Q ────────────────────────────────────────────────────
 
 _CASH_RE = re.compile(
@@ -349,13 +424,86 @@ def _parse_cash_runway(tenq_text: str) -> tuple[float | None, float | None, floa
     return cash, burn, runway
 
 
+# ─── Dilution velocity ────────────────────────────────────────────────────────
+
+_SHARES_OUTSTANDING_RE = re.compile(
+    r"(\d[\d,]+)\s+shares[^.]{0,80}(?:issued\s+and\s+outstanding|were\s+outstanding|outstanding\s+as\s+of)",
+    re.IGNORECASE,
+)
+
+
+def _compute_dilution_velocity(tenq_records: list[FilingRecord]) -> list[dict]:
+    """Extract shares outstanding from 10-Q cover pages and compute quarter-over-quarter delta."""
+    snapshots: list[dict] = []
+    for f in tenq_records:
+        text = f.full_text
+        m = _SHARES_OUTSTANDING_RE.search(text[:3000]) or _SHARES_OUTSTANDING_RE.search(text[:6000])
+        if not m:
+            continue
+        try:
+            shares = int(m.group(1).replace(",", ""))
+            snapshots.append({"date": f.filed_date, "shares": shares})
+        except ValueError:
+            pass
+    snapshots.sort(key=lambda x: x["date"])
+    for i, entry in enumerate(snapshots):
+        if i == 0:
+            entry["qoq_pct"] = None
+        else:
+            prev = snapshots[i - 1]["shares"]
+            entry["qoq_pct"] = round((entry["shares"] - prev) / prev * 100, 2) if prev > 0 else None
+    return snapshots
+
+
+# ─── Warrant overhang ─────────────────────────────────────────────────────────
+
+_WARRANT_FULL_RE = re.compile(
+    r"warrant[s]?\s+(?:to\s+purchase|exercisable\s+for)\s+(?:up\s+to\s+)?(\d[\d,]+)\s+shares"
+    r"[^.]{0,200}?\$\s*([\d.]+)\s*per\s+share",
+    re.IGNORECASE,
+)
+_EXPIRY_RE = re.compile(
+    r"expir(?:e|ing|ation)\s+(?:on\s+)?([A-Za-z]+ \d{1,2},? \d{4}|\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _extract_warrant_overhang(tenq_records: list[FilingRecord]) -> list[dict]:
+    """Extract warrant blocks (shares, strike, expiry) from 10-Q notes sections."""
+    results: list[dict] = []
+    seen: set[tuple] = set()
+    for f in tenq_records:
+        for m in _WARRANT_FULL_RE.finditer(f.full_text):
+            try:
+                shares = int(m.group(1).replace(",", ""))
+                strike = float(m.group(2))
+            except (ValueError, AttributeError):
+                continue
+            key = (shares, strike)
+            if key in seen:
+                continue
+            seen.add(key)
+            context = f.full_text[m.start():m.start() + 300]
+            expiry_m = _EXPIRY_RE.search(context)
+            expiry = expiry_m.group(1) if expiry_m else "Not stated"
+            results.append({"shares": shares, "strike": strike, "expiry": expiry})
+    results.sort(key=lambda x: x["strike"])
+    return results
+
+
 # ─── Catalyst date extraction ─────────────────────────────────────────────────
 
 _CATALYST_PATTERNS = [
     (re.compile(r"earnings\s+(?:release|date|call)[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Earnings"),
     (re.compile(r"FDA\s+(?:action|approval|decision|PDUFA)[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "FDA Event"),
+    (re.compile(r"NDA\s+(?:submission|filing|approval)[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "NDA Submission"),
+    (re.compile(r"clinical\s+(?:trial\s+)?(?:result|readout|data|topline)[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Clinical Trial Readout"),
     (re.compile(r"contract\s+award[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Contract Award"),
-    (re.compile(r"partnership\s+announcement[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Partnership"),
+    (re.compile(r"milestone\s+payment[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Milestone Payment"),
+    (re.compile(r"product\s+launch[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Product Launch"),
+    (re.compile(r"partnership\s+(?:agreement|announcement)[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Partnership"),
+    (re.compile(r"(?:analyst|investor)\s+day[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Investor Day"),
+    (re.compile(r"(?:annual|special)\s+(?:shareholders?|stockholders?)\s+meeting[^.]*?(\w+ \d{1,2},? \d{4})", re.IGNORECASE), "Shareholder Meeting"),
 ]
 
 
@@ -432,6 +580,7 @@ def fetch_edgar_data(ticker: str, progress_callback=None) -> EdgarData:
 
     form4s = [f for f in filings if f.form_type == "4"]
     data.insider_summary = _parse_insider_summary(form4s)
+    data.insider_clusters = _detect_insider_clusters(form4s)
 
     tenqs = [f for f in filings if f.form_type == "10-Q"]
     if tenqs:
@@ -439,6 +588,18 @@ def fetch_edgar_data(ticker: str, progress_callback=None) -> EdgarData:
         data.cash_and_equivalents = cash
         data.quarterly_burn = burn
         data.runway_months = runway
+
+    # Extended 10-Q history (up to 4 quarters back) for dilution velocity and warrant overhang.
+    # These are NOT added to data.filings — only used for structured pre-computation.
+    extended_tenqs = _fetch_extended_tenqs(submissions, cik, limit=4)
+    existing_accs = {f.accession_no for f in tenqs}
+    new_tenqs = [r for r in extended_tenqs if r.accession_no not in existing_accs]
+    for rec in new_tenqs:
+        sec_sleep()
+        rec.full_text = fetch_filing_text(rec)
+    all_tenqs = sorted(tenqs + new_tenqs, key=lambda f: f.filed_date)
+    data.dilution_velocity = _compute_dilution_velocity(all_tenqs)
+    data.warrant_overhang = _extract_warrant_overhang(all_tenqs)
 
     eightks = [f for f in filings if f.form_type == "8-K"]
     data.catalyst_dates = _extract_catalyst_dates(eightks)

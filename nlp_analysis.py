@@ -57,23 +57,22 @@ _MODEL_PRICING: dict[str, tuple[float, float]] = {
 
 # UPDATE 5A: thin filing guard appended to system prompt
 SYSTEM_PROMPT = """\
-You are a senior institutional equity research analyst with deep \
-expertise in microcap and small-cap market microstructure. You \
-specialize in identifying whether unusual volume events in small \
-securities represent genuine institutional accumulation ahead of \
-a catalyst, toxic financing distribution, or statistical noise.
+You are an expert forensic financial analyst specializing in \
+micro-cap and small-cap corporate finance ($10M–$2B market cap). \
+You audit SEC filings to determine whether observed price and \
+volume patterns represent genuine institutional accumulation or \
+active corporate dilution and toxic financing.
 
-You are rigorous, direct, and skeptical by default. You do not \
-speculate beyond what the data supports. When evidence is thin \
-you say so explicitly. Your job is to protect the trader from \
-bad trades as much as to identify good ones.
+You are rigorous, skeptical by default, and work strictly from \
+the regulatory record — not from chart patterns or market rumors. \
+When specific financial data should be present in filings but is \
+missing, flag it explicitly rather than estimating. When evidence \
+is thin, say so. Your job is to protect the trader from bad trades \
+as much as to identify good ones.
 
-Before producing any section, count substantive filings where \
-substantive means over 500 words. If fewer than 2 substantive \
-filings exist your response must begin with this exact line:
-THIN DATA WARNING: THIS BRIEF IS BASED ON INSUFFICIENT FILING \
-DEPTH AND SHOULD NOT BE USED AS A PRIMARY TRADE SIGNAL.
-Then continue with all sections flagging uncertainty throughout.\
+Execute the requested 5-step analytical audit precisely. Follow \
+the output format requirements exactly. Use actual numbers from \
+the filings. Do not omit any of the 5 sections.\
 """
 
 
@@ -176,6 +175,48 @@ def _format_form4_summary(parsed: dict) -> str:
     return "\n".join(lines)
 
 
+# ─── Pre-computed structured summaries ───────────────────────────────────────
+
+def _dilution_velocity_text(velocity: list[dict]) -> str:
+    if not velocity:
+        return "No historical 10-Q share count data available."
+    lines = []
+    for entry in velocity:
+        if entry.get("qoq_pct") is not None:
+            direction = "▲" if entry["qoq_pct"] > 0 else ("▼" if entry["qoq_pct"] < 0 else "—")
+            lines.append(f"  {entry['date']}: {entry['shares']:,} shares  {direction} {entry['qoq_pct']:+.2f}% QoQ")
+        else:
+            lines.append(f"  {entry['date']}: {entry['shares']:,} shares  (baseline)")
+    return "\n".join(lines)
+
+
+def _warrant_overhang_text(warrants: list[dict]) -> str:
+    if not warrants:
+        return "No warrants with extractable terms found in 10-Q filings."
+    lines = []
+    for w in warrants[:12]:
+        lines.append(f"  {w['shares']:,} shares @ ${w['strike']:.2f} strike — expires {w['expiry']}")
+    if len(warrants) > 12:
+        lines.append(f"  ... and {len(warrants) - 12} additional warrant tranches")
+    return "\n".join(lines)
+
+
+def _insider_cluster_text(clusters: list[dict]) -> str:
+    if not clusters:
+        return "No coordinated insider buying clusters detected in the filing window."
+    lines = []
+    for c in clusters:
+        names_str = ", ".join(c["names"][:3])
+        if len(c["names"]) > 3:
+            names_str += f" +{len(c['names']) - 3} more"
+        lines.append(
+            f"  {c['window_start']} → {c['window_end']}: "
+            f"{c['insider_count']} insiders, {c['transaction_count']} transactions "
+            f"({names_str})"
+        )
+    return "\n".join(lines)
+
+
 # ─── Insider summary text ─────────────────────────────────────────────────────
 
 def _insider_summary_text(s: InsiderSummary) -> str:
@@ -247,6 +288,21 @@ def _build_user_message(
         lines = [f"  {c['type']}: {c['date']} (from 8-K filed {c['filing_date']})" for c in edgar.catalyst_dates]
         catalyst_note = "\nCATALYST CALENDAR (extracted from 8-K filings):\n" + "\n".join(lines)
 
+    dilution_velocity_note = (
+        "\nSHARE COUNT DILUTION VELOCITY (last 4 quarters — pre-computed from 10-Q cover pages):\n"
+        + _dilution_velocity_text(edgar.dilution_velocity)
+    )
+
+    warrant_note = (
+        "\nWARRANT OVERHANG MAP (extracted from 10-Q notes — sorted by strike price):\n"
+        + _warrant_overhang_text(edgar.warrant_overhang)
+    )
+
+    cluster_note = (
+        "\nINSIDER BUYING CLUSTER ANALYSIS (coordinated P-code purchases within 14-day windows):\n"
+        + _insider_cluster_text(edgar.insider_clusters)
+    )
+
     filing_blocks = []
     form_type_set: set[str] = set()
     for f in edgar.filings:
@@ -264,8 +320,8 @@ def _build_user_message(
     filings_section = "\n".join(filing_blocks) if filing_blocks else "No filings found in the 90-day window."
     form_types_str = ", ".join(sorted(form_type_set)) if form_type_set else "none"
 
-    return f"""VOLUME SPIKE ANALYSIS REQUEST
-==============================
+    return f"""FORENSIC SEC FILING AUDIT REQUEST
+===================================
 Ticker: {ticker}
 Analysis date: {today}
 Current price: ${price}
@@ -277,8 +333,11 @@ Float: {float_str} shares
 Short interest as % of float: {short_pct}
 Institutional ownership: {inst_own}
 Insider ownership: {ins_own}
-Estimated cash runway: {runway_str} months
+Estimated cash runway: {runway_str} months (pre-computed from most recent 10-Q/K)
 {sector_rotation_note}{velocity_note}{catalyst_note}
+{dilution_velocity_note}
+{warrant_note}
+{cluster_note}
 
 INSIDER TRANSACTION SUMMARY (last 90 days):
 {_insider_summary_text(edgar.insider_summary)}
@@ -290,43 +349,71 @@ SEC FILINGS FOUND (last 90 days):
 
 {filings_section}
 
-Now produce a comprehensive research brief with exactly these sections:
+---
 
-1. STATISTICAL CONTEXT
-Interpret the volume Z-score and price pattern in plain language. Is this spike statistically significant? Does the price behavior match accumulation, distribution, or a one-off event?
+Execute the following 5-step analytical audit on the filing data above:
 
-2. FILING INVENTORY
-Table of all filings found: type, date, key parties involved if identifiable, one-line significance.
+STEP 1: CALCULATE THE CASH RUNWAY
+Extract from the most recent 10-Q or 10-K:
+- Cash and cash equivalents
+- Total current assets vs total current liabilities
+- Net cash used in operating activities (Statement of Cash Flows)
+Compute: Quarterly Burn Rate = most recent 6-month or 9-month operating cash burn annualized / 4
+Compute: Cash Runway (Quarters) = Current Cash / Quarterly Burn Rate
+CRITICAL THRESHOLD: Cash Runway < 4 quarters = severe structural pressure to dilute.
 
-3. INSTITUTIONAL ACCUMULATION ASSESSMENT
-For all Form 4 filings identify ONLY these as high-conviction: transaction code P, filed by CEO CFO Director or over 10% owner, value exceeding $50,000, no 10b5-1 plan mentioned. Everything else is LOW CONVICTION — do not include in this section. If nothing meets criteria state: NO HIGH-CONVICTION INSIDER BUYING FOUND.
-Is there evidence of genuine institutional buying from 13D or 13G filings? Quote specific filing language. If a new 13D or 13G filer appeared, who are they and what is their typical investment style if identifiable from the filing?
+STEP 2: AUDIT ATM OFFERING EXPOSURE
+Search all S-3, S-3/A, and 424B filings for "At-the-Market", "Sales Agreement", or "Equity Distribution Agreement".
+- Identify the sales agents by name
+- Extract total dollar capacity of the active ATM facility
+- Extract remaining balance available to be sold
 
-4. TOXIC FINANCING SCREEN
-Assess dilution risk using these exact factors:
-Factor A: S-3 or 424B filing exists AND cash runway under 9 months = HIGH DILUTION RISK
-Factor B: Convertible note with variable rate or reset or MFN clause = HIGH DILUTION RISK
-Factor C: S-3 exists but runway over 18 months and no convert language = ROUTINE
-Output exactly one of: CLEAN, ELEVATED, HIGH DILUTION RISK. One sentence citing specific filing and language. No score. No list.
+STEP 3: TRACK REAL-TIME SHARE COUNT DILUTION
+The pre-computed dilution velocity table above shows QoQ share count changes across up to 4 quarters.
+Use it to identify the trend. Also cross-reference with any 8-K or prospectus supplements for more recent share counts.
+- Cumulative dilution over 4 quarters > 10% is a structural red flag regardless of ATM status
+- QoQ increase > 2% during sideways price compression signals active ATM or equity line dilution
+- Accelerating QoQ rate (each quarter worse than the last) is highest severity
 
-5. SILENT WINDOW ANALYSIS
-Based on filing dates, volume pattern, and price behavior, estimate the timeline: when did institutional positioning likely begin, how many days before today, and how much runway likely remains before retail attention peaks. Be explicit about confidence level.
+STEP 4: SCREEN FOR TOXIC FINANCING AND CONVERTIBLE DEBT
+The warrant overhang map above lists known warrants with strike prices and expiry.
+Also search all 8-K and 10-Q/K filings for "Convertible Debentures", "Senior Secured Notes", "PIPE", or "Warrants".
+- Is there a Variable Conversion Price or Floating Discount to VWAP?
+- Is there a floor price? If floorless, this is a death-spiral structure.
+- Quote the exact variable pricing clause if found
+- For warrants: note if any strikes are near or below current price (in-the-money overhang)
 
-6. BEAR CASE
-What is the most likely explanation if this trade goes wrong? What would invalidate the accumulation thesis?
+STEP 5: VALIDATE INSIDER AND INSTITUTIONAL BLOCKS
+The insider buying cluster analysis above shows whether multiple insiders bought within the same 14-day windows.
+Coordinated cluster buying (2+ insiders, same window) is the highest-conviction insider signal.
+Form 4 audit: differentiate Code P (open market purchase) from Code M or A (options). Only count Code P.
+13D/G audit: is the reporting person an active small-cap fund building a stake, or a toxic funding entity (Yorkville, Lincoln Park, etc.) crossing 5% via conversion?
 
-7. KEY RISKS — ranked by severity
-Minimum 4 risks. Be specific to this ticker and these filings, not generic.
+---
 
-8. FINAL VERDICT
-Choose exactly one:
-  STRONG BUY SIGNAL — strong institutional anchor, clean capital structure, clear silent window
-  MODERATE BUY SIGNAL — some institutional evidence but incomplete or ambiguous
-  HOLD FOR MORE DATA — filing evidence is thin, wait for next EDGAR update
-  AVOID — toxic financing present or distribution pattern detected
-  INSUFFICIENT DATA — too few filings to assess
+OUTPUT FORMAT — use exactly this structure:
 
-Follow the verdict with a maximum 5-sentence summary of your complete reasoning. Be direct. A trader is reading this in real time.
+## 1. Executive Verdict
+- **Classification:** [Active Toxic Dilution / Active ATM Distribution / Dead Money / Genuine Accumulation]
+- **Confidence Score:** [0–100%]
+- **Core Catalyst:** [1-sentence explanation]
+
+## 2. Quantitative Health Metrics
+- **Current Cash:** $_________
+- **Quarterly Burn Rate:** $_________
+- **Estimated Cash Runway:** _________ Quarters
+- **90-Day Share Dilution Delta:** _________% increase in shares outstanding
+
+## 3. Dilution Mechanics Inventory
+- **Active ATM Facility?** [Yes/No — name agent and remaining balance]
+- **Toxic Convertible Covenants Found?** [Yes/No — quote the variable pricing clause if present]
+
+## 4. True Demand Footprint
+- **Legitimate Open-Market Insider Buying (Code P) Past 90 Days:** [Yes/No — state total shares and dollar amount]
+- **Active Institutional Block Building (13D/G):** [Yes/No — name the funds and stake sizes]
+
+## 5. Skeptical Conclusion
+Explain how the technical chart patterns (sideways compression, high-volume nodes, Z-score of {zscore}) match or contradict the fundamental regulatory profile found above. Be direct. A trader is reading this in real time.
 """
 
 
@@ -418,11 +505,10 @@ def run_analysis(
 
 def extract_verdict(brief_text: str) -> str:
     verdicts = [
-        "STRONG BUY SIGNAL",
-        "MODERATE BUY SIGNAL",
-        "HOLD FOR MORE DATA",
-        "AVOID",
-        "INSUFFICIENT DATA",
+        "ACTIVE TOXIC DILUTION",
+        "ACTIVE ATM DISTRIBUTION",
+        "GENUINE ACCUMULATION",
+        "DEAD MONEY",
     ]
     upper = brief_text.upper()
     for v in verdicts:
